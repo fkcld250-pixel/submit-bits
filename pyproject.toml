@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jyd-client"
+version = "0.1.0"
+description = "Linux CLI client for JYD FPGA batch testing"
+requires-python = ">=3.9"
+dependencies = [
+  "pymysql>=1.1.0",
+  "paramiko>=3.4.0",
+]
+
+[project.scripts]
+jyd-client = "jyd_client.cli:main"
+
+[tool.setuptools]
+packages = ["jyd_client"]

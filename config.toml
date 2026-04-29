@@ -1,0 +1,30 @@
+[mysql]
+host = "192.168.2.200"
+port = 3306
+user = "root"
+password = "123456"
+database = "port_manager"
+charset = "utf8mb4"
+
+[ssh]
+user = "remoteuser"
+password = "jyd123"
+port = 22
+timeout = 20
+
+[remote]
+vivado_path = "D:/vivado/Vivado/2023.2/bin/vivado.bat"
+temp_dir = "C:/Temp"
+hw_server_wait_seconds = 30
+serial_read_seconds = 60
+serial_idle_seconds = 3
+serial_stable_seconds = 15
+serial_baud_rate = 9600
+serial_poll_byte = "80"
+serial_poll_interval_seconds = 0.701
+serial_max_payload_bytes = 0
+hw_server_script_path = "C:/Temp/start_hw_server.ps1"
+use_generated_hw_server_script = false
+
+[local]
+results_jsonl = "results.jsonl"

@@ -1,0 +1,7 @@
+artifacts/
+bits/
+AGENTS.md
+.codex
+results.jsonl
+
+*/__pycache__/*
