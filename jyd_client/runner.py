@@ -11,12 +11,25 @@ from .remote import RemoteSession
 from .serial_reader import read_tcp_serial
 
 
+TASK_DISPLAY_MIN_EXCLUSIVE = 0x37000000
+TASK_DISPLAY_MAX_INCLUSIVE = 0x37999999
+TASK_EXPECTED_LED_HEX = "0x01221c08"
+
+
 class Runner:
     def __init__(self, cfg):
         self.cfg = cfg
         self.db = Database(cfg.mysql)
 
-    def run_bitfile(self, bitfile: str | Path, save_result: bool = True, timeout: int | None = None) -> RunResult:
+    def run_bitfile(
+        self,
+        bitfile: str | Path,
+        save_result: bool = True,
+        timeout: int | None = None,
+        force_use: bool = False,
+        fpga_name: str | None = None,
+        release_board: bool = True,
+    ) -> RunResult:
         bit_path = Path(bitfile).expanduser().resolve()
         result = RunResult.start(str(bit_path))
         board = None
@@ -26,12 +39,16 @@ class Runner:
             return result
 
         try:
-            board = self.db.allocate_board()
+            board = self.db.allocate_board(force=force_use, fpga_name=fpga_name)
             result.fpga_name = board.fpga_name
             result.board_ip = board.ip
             result.expected_result = board.expected_result
+            if not release_board:
+                self.db.mark_board_in_use(board.fpga_name)
+                log(f"keeping board {board.fpga_name} marked in_use after run")
+            allocation_mode = "forced" if force_use or fpga_name else "allocated"
             log(
-                "allocated board "
+                f"{allocation_mode} board "
                 f"{board.fpga_name} ip={board.ip} hw_port={board.total_port} "
                 f"serial_port={board.serial_tcp_port} com={board.serial_com_name}"
             )
@@ -92,6 +109,10 @@ class Runner:
                 result.parsed_result = ""
                 result.led = None
             result.success = _is_success(result.parsed_result, result.expected_result)
+            result.task_judgment = judge_task_result(result.parsed_result, result.led)
+            result.task_success = bool(result.task_judgment["success"])
+            if not result.task_success and not result.error:
+                result.error = _format_task_judgment_error(result.task_judgment)
             if (
                 not result.success
                 and not result.error
@@ -103,10 +124,11 @@ class Runner:
             log(
                 "serial read completed: "
                 f"payload={len(payload_bytes)} bytes "
-                f"parsed_result={result.parsed_result!r} led={result.led!r}"
+                f"parsed_result={result.parsed_result!r} led={result.led!r} "
+                f"task_success={result.task_success!r}"
             )
 
-            if save_result and result.success:
+            if save_result and result.task_success:
                 self.db.save_result(board.fpga_name, result.parsed_result)
                 log(f"saved result for {board.fpga_name}: {result.parsed_result}")
         except Exception as exc:
@@ -121,14 +143,19 @@ class Runner:
                         remote.stop_port_owner(board.serial_tcp_port)
                 except Exception as exc:
                     log(f"failed to stop remote ports for {board.fpga_name}: {exc}")
-                try:
-                    log(f"releasing board {board.fpga_name}")
-                    self.db.release_board(board.fpga_name)
-                    log(f"released board {board.fpga_name}")
-                except Exception as exc:
-                    release_error = f"failed to release board {board.fpga_name}: {exc}"
-                    result.error = f"{result.error}; {release_error}" if result.error else release_error
-                    log(release_error)
+                if release_board:
+                    try:
+                        log(f"releasing board {board.fpga_name}")
+                        self.db.release_board(board.fpga_name)
+                        log(f"released board {board.fpga_name}")
+                    except Exception as exc:
+                        release_error = f"failed to release board {board.fpga_name}: {exc}"
+                        result.error = f"{result.error}; {release_error}" if result.error else release_error
+                        log(release_error)
+                else:
+                    log(f"skipping board release for {board.fpga_name}; status remains in_use")
+            result.task_judgment = judge_task_result(result.parsed_result, result.led)
+            result.task_success = bool(result.task_judgment["success"])
             result.finish()
 
         return result
@@ -145,6 +172,43 @@ def _is_success(parsed_result: str, expected_result: str | None) -> bool:
         return int(parsed_result[2:]) < int(expected_result[2:])
     except ValueError:
         return False
+
+
+def judge_task_result(parsed_result: str, led: dict[str, object] | None) -> dict[str, object]:
+    display_value = _parse_hex_int(parsed_result)
+    display_ok = (
+        display_value is not None
+        and TASK_DISPLAY_MIN_EXCLUSIVE < display_value <= TASK_DISPLAY_MAX_INCLUSIVE
+    )
+    led_hex = str(led.get("hex", "")) if isinstance(led, dict) else ""
+    led_ok = led_hex.lower() == TASK_EXPECTED_LED_HEX
+    return {
+        "success": display_ok and led_ok,
+        "display_ok": display_ok,
+        "led_ok": led_ok,
+        "display_value": parsed_result,
+        "display_min_exclusive": f"0x{TASK_DISPLAY_MIN_EXCLUSIVE:08x}",
+        "display_max_inclusive": f"0x{TASK_DISPLAY_MAX_INCLUSIVE:08x}",
+        "led_hex": led_hex,
+        "expected_led_hex": TASK_EXPECTED_LED_HEX,
+    }
+
+
+def _format_task_judgment_error(judgment: dict[str, object]) -> str:
+    return (
+        "task judgment failed: "
+        f"display={judgment.get('display_value', '')!r} "
+        f"display_ok={judgment.get('display_ok', False)!r} "
+        f"led_hex={judgment.get('led_hex', '')!r} "
+        f"led_ok={judgment.get('led_ok', False)!r}"
+    )
+
+
+def _parse_hex_int(value: str) -> int | None:
+    try:
+        return int(value, 16)
+    except (TypeError, ValueError):
+        return None
 
 
 class _SignalSampleFilter:

@@ -20,6 +20,18 @@ python3 -m jyd_client.cli run path/to/design.bit --user 13599187486 --password 1
 python3 -m jyd_client.cli batch path/to/bits --user 13599187486 --password 1234567
 ```
 
+If stale `in_use` board state blocks testing, force board selection:
+
+```bash
+python3 -m jyd_client.cli run path/to/design.bit --skip-login --force-use
+python3 -m jyd_client.cli run path/to/design.bit --skip-login --fpga FPGA1
+```
+
+`--force-use` ignores the database `in_use` state and randomly selects from all
+FPGA resources. `--fpga` forces a specific `fpga_name` and implies
+`--force-use`. In batch mode, `--fpga` runs with one worker to avoid programming
+the same board concurrently.
+
 The default configuration targets `192.168.2.200`, MySQL database `port_manager`, and SSH user `remoteuser`.
 
 ## Configuration
@@ -36,10 +48,16 @@ Important defaults:
 
 ## Output
 
-`run` prints one JSON object. `batch` writes JSONL rows to `results.jsonl` by default. Each row includes board identity, burn status, raw serial hex data, parsed display result, LED state, and errors.
+`run` prints one JSON object. `batch` writes JSONL rows to `results.jsonl` by default. Each row includes board identity, burn status, parsed display result, LED state, and errors.
 
 Progress logs are written to stderr so stdout remains machine-readable JSON.
 
 ## Notes
 
 This client does not modify the Windows GUI program. It directly implements the backend flow observed in the packaged Python bytecode: login via MySQL, allocate a board, SSH to the remote Windows host, run Vivado/hw_server/com2tcp, read the forwarded serial stream, parse the seven-segment display, then release the board.
+
+Bitstreams are compressed locally to a temporary zip named like `bits.z12345`,
+uploaded by SFTP, extracted on the remote Windows host, and then removed. Each
+programming attempt cleans remote `bits.z*` files before upload, immediately
+after extraction, and again during final cleanup; these cleanup steps are logged
+to stderr.

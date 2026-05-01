@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 import socket
+import tempfile
 import time
+import uuid
+import zipfile
 
 from .errors import RemoteCommandError, require_module
 from .logging_utils import log
@@ -62,7 +65,7 @@ class RemoteSession:
         progress = _UploadProgress(total_size)
         with self.client.open_sftp() as sftp:
             sftp.put(str(local), remote_path, callback=progress)
-        log(f"bitstream uploaded to {self.host}:{remote_path}")
+        log(f"uploaded {local.name} to {self.host}:{remote_path}")
 
     def ensure_temp(self) -> str:
         temp_dir = self.remote_cfg.get("temp_dir", "C:/Temp")
@@ -167,15 +170,64 @@ class RemoteSession:
         remote_bit = win_join(temp_dir, f"{board.fpga_name}_fpga.bit")
         remote_tcl = win_join(temp_dir, f"{board.fpga_name}_auto_program.tcl")
         local_tcl = generate_program_tcl(bitfile_remote=remote_bit, port=board.total_port)
+        remote_zip = win_join(temp_dir, f"bits.z{uuid.uuid4().hex[:5]}")
 
-        self.put_file(bitfile, remote_bit)
-        self.put_text(remote_tcl, local_tcl)
-        vivado = self.remote_cfg["vivado_path"]
-        command = f'cmd /c ""{vivado}" -mode batch -source "{remote_tcl}""'
-        status, out, err = self.exec(command, check=False, timeout=600)
+        self.cleanup_bitstream_zip(remote_zip, reason="before upload")
+        try:
+            with tempfile.TemporaryDirectory(prefix="jyd-bitstream-zip-") as tmp_dir:
+                local_zip = Path(tmp_dir) / Path(remote_zip).name
+                with zipfile.ZipFile(local_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                    archive.write(bitfile, arcname=Path(remote_bit).name)
+                log(
+                    "compressed bitstream "
+                    f"{bitfile.name} -> {local_zip.name} ({_format_bytes(local_zip.stat().st_size)})"
+                )
+                self.put_file(local_zip, remote_zip)
+
+            self.extract_bitstream_zip(remote_zip, temp_dir, remote_bit)
+            self.cleanup_bitstream_zip(remote_zip, reason="after extract")
+            self.put_text(remote_tcl, local_tcl)
+            vivado = self.remote_cfg["vivado_path"]
+            command = f'cmd /c ""{vivado}" -mode batch -source "{remote_tcl}""'
+            status, out, err = self.exec(command, check=False, timeout=600)
+            if status != 0:
+                raise RemoteCommandError(f"Vivado programming failed ({status})\nSTDOUT:\n{out}\nSTDERR:\n{err}")
+            log(f"Vivado programming completed for {bitfile.name} on {self.host}")
+        finally:
+            self.cleanup_bitstream_zip(remote_zip, reason="final cleanup")
+
+    def cleanup_bitstream_zip(self, remote_zip: str, reason: str = "cleanup") -> None:
+        log(f"cleaning temporary bitstream zip ({reason}): {self.host}:{remote_zip}")
+        script = (
+            f"$zip={ps_quote(remote_zip)}; "
+            "if(Test-Path -LiteralPath $zip){ "
+            "Remove-Item -LiteralPath $zip -Force -ErrorAction Stop; "
+            "}; "
+            "exit 0"
+        )
+        command = (
+            'powershell -NoProfile -Command '
+            f'"{script}"'
+        )
+        status, out, err = self.exec(command, check=False)
         if status != 0:
-            raise RemoteCommandError(f"Vivado programming failed ({status})\nSTDOUT:\n{out}\nSTDERR:\n{err}")
-        log(f"Vivado programming completed for {bitfile.name} on {self.host}")
+            raise RemoteCommandError(f"failed to clean temporary bitstream zip ({status})\nSTDOUT:\n{out}\nSTDERR:\n{err}")
+        log(f"temporary bitstream zip cleanup completed ({reason})")
+
+    def extract_bitstream_zip(self, remote_zip: str, temp_dir: str, remote_bit: str) -> None:
+        script = (
+            f"$zip={ps_quote(remote_zip)}; "
+            f"$dest={ps_quote(temp_dir)}; "
+            f"$bit={ps_quote(remote_bit)}; "
+            "if(Test-Path -LiteralPath $bit){ Remove-Item -LiteralPath $bit -Force }; "
+            "Add-Type -AssemblyName System.IO.Compression.FileSystem; "
+            "[System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $dest)"
+        )
+        command = f'powershell -NoProfile -Command "{script}"'
+        status, out, err = self.exec(command, check=False, timeout=120)
+        if status != 0:
+            raise RemoteCommandError(f"failed to extract bitstream zip ({status})\nSTDOUT:\n{out}\nSTDERR:\n{err}")
+        log(f"extracted bitstream zip on {self.host}:{remote_zip}")
 
 
 def wait_tcp(host: str, port: int, timeout: int) -> None:

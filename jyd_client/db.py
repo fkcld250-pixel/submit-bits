@@ -72,11 +72,18 @@ class Database:
                 rows = cur.fetchall()
         return [Board.from_row(row) for row in rows]
 
-    def allocate_board(self) -> Board:
-        select_sql = """
+    def allocate_board(self, force: bool = False, fpga_name: str | None = None) -> Board:
+        where_sql = ""
+        params: tuple[str, ...] = ()
+        if fpga_name:
+            where_sql = "WHERE fpga_name = %s"
+            params = (fpga_name,)
+        elif not force:
+            where_sql = "WHERE status = 'available'"
+        select_sql = f"""
             SELECT fpga_name, total_port, twin_port, jtag_filter, vcom_name, com_name, IP, result
             FROM fpga_boards
-            WHERE status = 'available'
+            {where_sql}
             ORDER BY RAND()
             LIMIT 1
         """
@@ -85,11 +92,18 @@ class Database:
             with self.connect() as conn:
                 try:
                     with conn.cursor() as cur:
-                        cur.execute(select_sql)
+                        cur.execute(select_sql, params)
                         row = cur.fetchone()
                         if not row:
+                            if fpga_name:
+                                raise BoardUnavailableError(f"FPGA board not found: {fpga_name}")
+                            if force:
+                                raise BoardUnavailableError("no FPGA board found")
                             raise BoardUnavailableError("no available FPGA board")
                         board = Board.from_row(row)
+                        if force or fpga_name:
+                            conn.commit()
+                            return board
                         cur.execute(update_sql, (board.fpga_name,))
                         if cur.rowcount != 1:
                             conn.rollback()
@@ -105,6 +119,12 @@ class Database:
         with self.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("UPDATE fpga_boards SET status = 'available' WHERE fpga_name = %s", (fpga_name,))
+            conn.commit()
+
+    def mark_board_in_use(self, fpga_name: str) -> None:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE fpga_boards SET status = 'in_use' WHERE fpga_name = %s", (fpga_name,))
             conn.commit()
 
     def reset_all_boards_available(self) -> int:

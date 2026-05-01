@@ -58,6 +58,8 @@ class RunResult:
     parsed_result: str = ""
     led: dict[str, Any] | None = None
     expected_result: str | None = None
+    task_success: bool = False
+    task_judgment: dict[str, Any] | None = None
     error: str | None = None
 
     @classmethod
