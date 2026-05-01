@@ -9,6 +9,14 @@ from typing import Any
 class User:
     user_id: int
     username: str
+    used_times: int | None = None
+    limit_times: int | None = None
+
+    @property
+    def remaining_times(self) -> int | None:
+        if self.limit_times is None or self.limit_times <= 0 or self.used_times is None:
+            return None
+        return max(0, self.limit_times - self.used_times)
 
 
 @dataclass(frozen=True)
@@ -60,6 +68,11 @@ class RunResult:
     expected_result: str | None = None
     task_success: bool = False
     task_judgment: dict[str, Any] | None = None
+    user_id: int | None = None
+    usage_counted: bool = False
+    used_times_before: int | None = None
+    limit_times: int | None = None
+    remaining_times_after: int | None = None
     error: str | None = None
 
     @classmethod

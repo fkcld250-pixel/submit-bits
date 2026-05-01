@@ -10,6 +10,10 @@ class AuthenticationError(JydClientError):
     pass
 
 
+class QuotaExceededError(AuthenticationError):
+    pass
+
+
 class BoardUnavailableError(JydClientError):
     pass
 

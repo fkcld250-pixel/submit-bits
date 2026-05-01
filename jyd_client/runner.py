@@ -47,6 +47,7 @@ class Runner:
                 self.db.mark_board_in_use(board.fpga_name)
                 log(f"keeping board {board.fpga_name} marked in_use after run")
             allocation_mode = "forced" if force_use or fpga_name else "allocated"
+            log(f"confirmed board {board.fpga_name} status=in_use ({allocation_mode})")
             log(
                 f"{allocation_mode} board "
                 f"{board.fpga_name} ip={board.ip} hw_port={board.total_port} "
@@ -269,10 +270,7 @@ def _log_stable_signal_sample(snapshot: object, stable_elapsed: float) -> None:
         return
     led = snapshot.get("led")
     if isinstance(led, dict):
-        led_text = (
-            f"bits={led.get('bits', '')!r} hex={led.get('hex', '')!r} "
-            f"active_indices={led.get('active_indices', [])!r}"
-        )
+        led_text = f"bits={led.get('bits', '')!r} hex={led.get('hex', '')!r}"
     else:
         led_text = repr(led)
     log(

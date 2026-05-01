@@ -11,7 +11,8 @@ from threading import Lock
 
 from .config import load_config
 from .db import Database
-from .errors import JydClientError
+from .errors import JydClientError, QuotaExceededError
+from .models import RunResult
 from .runner import Runner
 
 
@@ -24,7 +25,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "login":
             password = args.password or getpass.getpass("Password: ")
             user = Database(cfg.mysql).authenticate(args.user, password)
-            print(json.dumps({"ok": True, "user_id": user.user_id, "username": user.username}, ensure_ascii=False))
+            print(json.dumps({"ok": True, **_user_usage_dict(user)}, ensure_ascii=False))
+            return 0
+        if args.command == "set-user-usage":
+            user = Database(cfg.mysql).set_user_usage(
+                args.user,
+                limit_times=args.limit_times,
+                used_times=args.used_times,
+            )
+            print(json.dumps({"ok": True, **_user_usage_dict(user)}, ensure_ascii=False))
             return 0
         if args.command == "list-boards":
             boards = Database(cfg.mysql).list_boards()
@@ -40,24 +49,25 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"ok": True, "status": "available", "affected": affected}, ensure_ascii=False))
             return 0
         if args.command == "run":
-            _authenticate_if_requested(cfg, args)
+            _authenticate_if_requested(cfg, args, count_usage=False)
             _apply_serial_overrides(cfg, args)
-            result = _run_bitfile_with_retries(Runner(cfg), args.bitfile, args)
+            result = _run_one_counted_bitfile(cfg, args.bitfile, args)
             print(json.dumps(result.to_dict(), ensure_ascii=False))
             return 0 if result.task_success and not result.error else 1
         if args.command == "stability":
-            _authenticate_if_requested(cfg, args)
+            _authenticate_if_requested(cfg, args, count_usage=False)
             _apply_serial_overrides(cfg, args)
             return _run_stability_test(cfg, args)
         if args.command == "sweep-fpgas":
-            _authenticate_if_requested(cfg, args)
+            _authenticate_if_requested(cfg, args, count_usage=False)
             _apply_serial_overrides(cfg, args)
             return _run_fpga_sweep(cfg, args)
         if args.command == "batch":
-            _authenticate_if_requested(cfg, args)
+            _authenticate_if_requested(cfg, args, count_usage=False)
             _apply_serial_overrides(cfg, args)
             jobs = _batch_job_count(args)
             bitfiles = _collect_bitfiles(args.path, args.pattern)
+            _log_batch_usage_hint(cfg, args, len(bitfiles))
             output = Path(args.output or cfg.local["results_jsonl"]).expanduser()
             failures = 0
             with output.open("a", encoding="utf-8") as f:
@@ -89,8 +99,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     login = sub.add_parser("login", help="Validate contest account against server database")
-    login.add_argument("--user", required=True)
+    login.add_argument("--user", default="admin")
     login.add_argument("--password")
+
+    set_usage = sub.add_parser("set-user-usage", help="Set a user's used_times and/or limit_times")
+    set_usage.add_argument("--user", required=True, help="Username or numeric user_id")
+    set_usage.add_argument("--limit-times", type=int)
+    set_usage.add_argument("--used-times", type=int)
 
     sub.add_parser("list-boards", help="List FPGA boards from database")
 
@@ -156,7 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def add_auth_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--user", default="13599187486")
+    parser.add_argument("--user", default="admin")
     parser.add_argument("--password")
     parser.add_argument("--skip-login", action="store_true", help="Skip contest account validation")
 
@@ -190,11 +205,19 @@ def add_hold_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _authenticate_if_requested(cfg, args) -> None:
+def _authenticate_if_requested(cfg, args, *, count_usage: bool = False):
     if args.skip_login:
+        print("skip-login: contest authentication skipped; usage count was not incremented", file=sys.stderr)
         return
     password = args.password or getpass.getpass("Password: ")
-    Database(cfg.mysql).authenticate(args.user, password)
+    user = Database(cfg.mysql).authenticate(args.user, password)
+    args.authenticated_user_id = user.user_id
+    args.authenticated_username = user.username
+    args.authenticated_used_times = user.used_times
+    args.authenticated_limit_times = user.limit_times
+    if count_usage:
+        return _increment_usage_for_user(cfg, user.user_id)
+    return user
 
 
 def _apply_serial_overrides(cfg, args) -> None:
@@ -234,8 +257,102 @@ def _run_bitfile_with_retry_info(runner: Runner, bitfile: str | Path, args) -> t
         attempt += 1
 
 
+def _run_one_counted_bitfile(cfg, bitfile: str | Path, args) -> object:
+    bit_path = Path(bitfile).expanduser()
+    if not bit_path.exists():
+        result = RunResult.start(str(bit_path))
+        result.error = f"bitfile not found: {bit_path}"
+        result.finish()
+        return result
+    usage = _count_usage_for_bitfile(cfg, bitfile, args)
+    if usage.get("error"):
+        return _quota_result(bitfile, usage)
+    result = _run_bitfile_with_retries(Runner(cfg), bitfile, args)
+    _attach_usage(result, usage)
+    return result
+
+
 def _run_batch_bitfile(cfg, bitfile: str | Path, args) -> object:
-    return _run_bitfile_with_retries(Runner(cfg), bitfile, args)
+    return _run_one_counted_bitfile(cfg, bitfile, args)
+
+
+def _count_usage_for_bitfile(cfg, bitfile: str | Path, args) -> dict[str, object]:
+    if getattr(args, "skip_login", False):
+        print(f"skip-login: usage count was not incremented for bitfile={bitfile}", file=sys.stderr)
+        return {"usage_counted": False}
+    user_id = getattr(args, "authenticated_user_id", None)
+    if user_id is None:
+        raise JydClientError("internal error: missing authenticated user_id")
+    try:
+        return _increment_usage_for_user(cfg, int(user_id))
+    except QuotaExceededError as exc:
+        user = Database(cfg.mysql).get_user_usage(int(user_id))
+        return {
+            "user_id": int(user_id),
+            "usage_counted": False,
+            "used_times_before": user.used_times,
+            "limit_times": user.limit_times,
+            "remaining_times_after": user.remaining_times,
+            "error": str(exc),
+        }
+
+
+def _increment_usage_for_user(cfg, user_id: int) -> dict[str, object]:
+    user = Database(cfg.mysql).increment_usage_count(user_id)
+    used_after = user.used_times
+    used_before = used_after - 1 if used_after is not None else None
+    return {
+        "user_id": user.user_id,
+        "usage_counted": True,
+        "used_times_before": used_before,
+        "limit_times": user.limit_times,
+        "remaining_times_after": user.remaining_times,
+    }
+
+
+def _attach_usage(result: object, usage: dict[str, object]) -> None:
+    for key in ("user_id", "usage_counted", "used_times_before", "limit_times", "remaining_times_after"):
+        if key in usage:
+            setattr(result, key, usage[key])
+
+
+def _quota_result(bitfile: str | Path, usage: dict[str, object]) -> RunResult:
+    result = RunResult.start(str(Path(bitfile).expanduser()))
+    _attach_usage(result, usage)
+    result.error = str(usage["error"])
+    result.finish()
+    return result
+
+
+def _log_batch_usage_hint(cfg, args, bitfile_count: int) -> None:
+    if getattr(args, "skip_login", False):
+        print(
+            f"skip-login: batch has {bitfile_count} bitfile(s); usage count will not be incremented",
+            file=sys.stderr,
+        )
+        return
+    user_id = getattr(args, "authenticated_user_id", None)
+    if user_id is None:
+        return
+    user = Database(cfg.mysql).get_user_usage(int(user_id))
+    remaining = "unlimited" if user.remaining_times is None else str(user.remaining_times)
+    print(
+        f"user {user.username} usage before batch: used_times={user.used_times or 0} "
+        f"limit_times={user.limit_times} remaining={remaining} bitfiles={bitfile_count}",
+        file=sys.stderr,
+    )
+
+
+def _user_usage_dict(user) -> dict[str, object]:
+    return {
+        "user_id": user.user_id,
+        "username": user.username,
+        "used_times": user.used_times,
+        "limit_times": user.limit_times,
+        "remaining_times": user.remaining_times,
+    }
+
+
 
 
 def _release_retry_hold_if_needed(runner: Runner, result: object, args) -> None:

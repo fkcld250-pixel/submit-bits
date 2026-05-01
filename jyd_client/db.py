@@ -4,7 +4,13 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Iterator
 
-from .errors import AuthenticationError, BoardUnavailableError, require_module
+from .errors import (
+    AuthenticationError,
+    BoardUnavailableError,
+    JydClientError,
+    QuotaExceededError,
+    require_module,
+)
 from .models import Board, User
 
 
@@ -33,7 +39,7 @@ class Database:
     def authenticate(self, username: str, password: str) -> User:
         sql = """
             SELECT u.user_id, u.password, u.user_status, u.username,
-                   c.allowed_start, c.allowed_end
+                   c.allowed_start, c.allowed_end, u.used_times, u.limit_times
             FROM users u
             JOIN classes c ON u.class_id = c.class_id
             WHERE u.username=%s
@@ -58,7 +64,102 @@ class Database:
         if end and now > end:
             raise AuthenticationError(f"login not allowed after {end}")
 
-        return User(user_id=int(row["user_id"]), username=str(row["username"]))
+        user = User(
+            user_id=int(row["user_id"]),
+            username=str(row["username"]),
+            used_times=_optional_int(row.get("used_times")),
+            limit_times=_optional_int(row.get("limit_times")),
+        )
+        if _quota_exhausted(user.used_times, user.limit_times):
+            raise QuotaExceededError(_format_quota_error(user.used_times, user.limit_times))
+        return user
+
+    def get_user_usage(self, username_or_user_id: str | int) -> User:
+        if isinstance(username_or_user_id, int) or str(username_or_user_id).isdigit():
+            where_sql = "user_id = %s"
+            value = int(username_or_user_id)
+        else:
+            where_sql = "username = %s"
+            value = str(username_or_user_id)
+        sql = f"""
+            SELECT user_id, username, used_times, limit_times
+            FROM users
+            WHERE {where_sql}
+        """
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (value,))
+                row = cur.fetchone()
+        if not row:
+            raise AuthenticationError(f"user not found: {username_or_user_id}")
+        return User(
+            user_id=int(row["user_id"]),
+            username=str(row["username"]),
+            used_times=_optional_int(row.get("used_times")),
+            limit_times=_optional_int(row.get("limit_times")),
+        )
+
+    def increment_usage_count(self, user_id: int) -> User:
+        select_sql = """
+            SELECT user_id, username, used_times, limit_times
+            FROM users
+            WHERE user_id = %s
+            FOR UPDATE
+        """
+        update_sql = "UPDATE users SET used_times = COALESCE(used_times, 0) + 1 WHERE user_id = %s"
+        with self.connect() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(select_sql, (user_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        raise AuthenticationError(f"user not found: {user_id}")
+                    used_times = _optional_int(row.get("used_times")) or 0
+                    limit_times = _optional_int(row.get("limit_times"))
+                    if _quota_exhausted(used_times, limit_times):
+                        raise QuotaExceededError(_format_quota_error(used_times, limit_times))
+                    cur.execute(update_sql, (user_id,))
+                    row["used_times"] = used_times + 1
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return User(
+            user_id=int(row["user_id"]),
+            username=str(row["username"]),
+            used_times=_optional_int(row.get("used_times")),
+            limit_times=_optional_int(row.get("limit_times")),
+        )
+
+    def set_user_usage(
+        self,
+        username_or_user_id: str | int,
+        *,
+        limit_times: int | None = None,
+        used_times: int | None = None,
+    ) -> User:
+        if limit_times is None and used_times is None:
+            raise JydClientError("at least one of --limit-times or --used-times must be provided")
+        if limit_times is not None and limit_times < 0:
+            raise JydClientError("--limit-times must be >= 0")
+        if used_times is not None and used_times < 0:
+            raise JydClientError("--used-times must be >= 0")
+        user = self.get_user_usage(username_or_user_id)
+        assignments = []
+        params: list[int] = []
+        if limit_times is not None:
+            assignments.append("limit_times = %s")
+            params.append(limit_times)
+        if used_times is not None:
+            assignments.append("used_times = %s")
+            params.append(used_times)
+        params.append(user.user_id)
+        sql = f"UPDATE users SET {', '.join(assignments)} WHERE user_id = %s"
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params))
+            conn.commit()
+        return self.get_user_usage(user.user_id)
 
     def list_boards(self) -> list[Board]:
         sql = """
@@ -88,6 +189,7 @@ class Database:
             LIMIT 1
         """
         update_sql = "UPDATE fpga_boards SET status = 'in_use' WHERE fpga_name = %s AND status = 'available'"
+        force_update_sql = "UPDATE fpga_boards SET status = 'in_use' WHERE fpga_name = %s"
         for _ in range(5):
             with self.connect() as conn:
                 try:
@@ -102,6 +204,7 @@ class Database:
                             raise BoardUnavailableError("no available FPGA board")
                         board = Board.from_row(row)
                         if force or fpga_name:
+                            cur.execute(force_update_sql, (board.fpga_name,))
                             conn.commit()
                             return board
                         cur.execute(update_sql, (board.fpga_name,))
@@ -165,3 +268,19 @@ def _to_datetime(value):
             except ValueError:
                 pass
     return None
+
+
+def _optional_int(value):
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
+def _quota_exhausted(used_times: int | None, limit_times: int | None) -> bool:
+    if limit_times is None or limit_times <= 0:
+        return False
+    return (used_times or 0) >= limit_times
+
+
+def _format_quota_error(used_times: int | None, limit_times: int | None) -> str:
+    return f"usage quota exhausted: used_times={used_times or 0} limit_times={limit_times}"

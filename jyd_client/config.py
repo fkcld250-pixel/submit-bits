@@ -14,7 +14,7 @@ DEFAULT_CONFIG = {
         "host": "192.168.2.200",
         "port": 3306,
         "user": "root",
-        "password": "123456",
+        "password": "jyd123",
         "database": "port_manager",
         "charset": "utf8mb4",
     },

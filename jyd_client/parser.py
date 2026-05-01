@@ -144,12 +144,11 @@ def _parse_csv_display(binary_str: str) -> str:
 def _parse_led_bits(binary_str: str) -> dict[str, object]:
     bits = [x.strip() for x in binary_str.split(",") if x.strip() in {"0", "1"}]
     if not bits:
-        return {"bits": "", "hex": "", "active_indices": []}
+        return {"bits": "", "hex": ""}
     bit_string = "".join(bits)
     return {
         "bits": bit_string,
         "hex": _bits_to_hex(bit_string),
-        "active_indices": [i for i, bit in enumerate(bits) if bit == "1"],
     }
 
 

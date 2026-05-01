@@ -14,10 +14,10 @@ pip install -r requirements.txt
 ## Quick Use
 
 ```bash
-python3 -m jyd_client.cli login --user 13599187486 --password 1234567
+python3 -m jyd_client.cli login --user admin --password jyd123
 python3 -m jyd_client.cli list-boards
-python3 -m jyd_client.cli run path/to/design.bit --user 13599187486 --password 1234567
-python3 -m jyd_client.cli batch path/to/bits --user 13599187486 --password 1234567
+python3 -m jyd_client.cli run path/to/design.bit --user admin --password jyd123
+python3 -m jyd_client.cli batch path/to/bits --user admin --password jyd123
 ```
 
 If stale `in_use` board state blocks testing, force board selection:
@@ -30,7 +30,28 @@ python3 -m jyd_client.cli run path/to/design.bit --skip-login --fpga FPGA1
 `--force-use` ignores the database `in_use` state and randomly selects from all
 FPGA resources. `--fpga` forces a specific `fpga_name` and implies
 `--force-use`. In batch mode, `--fpga` runs with one worker to avoid programming
-the same board concurrently.
+the same board concurrently. Forced runs still mark the selected board
+`in_use` while the command is running and release it at the end.
+
+The new official platform limits submissions with `users.used_times` and
+`users.limit_times`. Normal `run` and `batch` commands increment `used_times`
+once per bitfile before allocating an FPGA board. `--skip-login` skips
+authentication and does not increment usage; stderr logs this explicitly.
+
+To inspect login and quota state without incrementing usage:
+
+```bash
+python3 -m jyd_client.cli login --user admin --password jyd123
+```
+
+To set a user's usage counters:
+
+```bash
+python3 -m jyd_client.cli set-user-usage --user admin --limit-times 20 --used-times 0
+```
+
+Do not run `set-user-usage` or real `run`/`batch` tests against a production
+account unless you intend to change that account's counters.
 
 The default configuration targets `192.168.2.200`, MySQL database `port_manager`, and SSH user `remoteuser`.
 
@@ -40,7 +61,7 @@ On first run, the client creates `config.toml` next to this README. Edit it if t
 
 Important defaults:
 
-- MySQL: `192.168.2.200:3306`, user `root`, password `123456`, database `port_manager`
+- MySQL: `192.168.2.200:3306`, user `root`, password `jyd123`, database `port_manager`
 - SSH: user `remoteuser`, password `jyd123`, port `22`
 - Remote Vivado path: `D:/vivado/Vivado/2023.2/bin/vivado.bat`
 - Remote temp directory: `C:/Temp`
@@ -48,7 +69,7 @@ Important defaults:
 
 ## Output
 
-`run` prints one JSON object. `batch` writes JSONL rows to `results.jsonl` by default. Each row includes board identity, burn status, parsed display result, LED state, and errors.
+`run` prints one JSON object. `batch` writes JSONL rows to `results.jsonl` by default. Each row includes board identity, burn status, parsed display result, LED state, quota accounting fields, and errors.
 
 Progress logs are written to stderr so stdout remains machine-readable JSON.
 
