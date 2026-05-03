@@ -1,0 +1,225 @@
+name: Test encrypted bitstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      bitstream_zip_url:
+        description: "Download URL for an encrypted zip containing exactly one .bit file"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test-bitstream:
+    name: Test bitstream on FPGA
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openvpn p7zip-full
+
+      - name: Download encrypted zip
+        env:
+          BITSTREAM_ZIP_URL: ${{ inputs.bitstream_zip_url }}
+        run: |
+          set -euo pipefail
+          curl --fail --location --show-error --retry 3 --output "$RUNNER_TEMP/bitstream.zip" "$BITSTREAM_ZIP_URL"
+          test -s "$RUNNER_TEMP/bitstream.zip"
+
+      - name: Decrypt and validate bitstream
+        env:
+          JYD_BITSTREAM_ZIP_PASSWORD: ${{ secrets.JYD_BITSTREAM_ZIP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${JYD_BITSTREAM_ZIP_PASSWORD}" ]; then
+            echo "JYD_BITSTREAM_ZIP_PASSWORD secret is empty or missing" >&2
+            exit 1
+          fi
+
+          extract_dir="$RUNNER_TEMP/bitstream"
+          mkdir -p "$extract_dir"
+          7z x "$RUNNER_TEMP/bitstream.zip" "-p${JYD_BITSTREAM_ZIP_PASSWORD}" "-o${extract_dir}" -y
+
+          mapfile -d '' files < <(find "$extract_dir" -type f -print0)
+          if [ "${#files[@]}" -ne 1 ]; then
+            echo "Expected exactly one file in the encrypted zip, found ${#files[@]}" >&2
+            find "$extract_dir" -mindepth 1 -print >&2
+            exit 1
+          fi
+
+          bitfile="${files[0]}"
+          case "${bitfile,,}" in
+            *.bit) ;;
+            *)
+              echo "Expected a .bit file, got: $bitfile" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "BITFILE<<EOF"
+            echo "$bitfile"
+            echo "EOF"
+            echo "BITFILE_NAME=$(basename "$bitfile")"
+          } >> "$GITHUB_ENV"
+
+      - name: Start OpenVPN
+        env:
+          JYD_OPENVPN_CONFIG: ${{ secrets.JYD_OPENVPN_CONFIG }}
+        run: |
+          set -euo pipefail
+          if [ -z "${JYD_OPENVPN_CONFIG}" ]; then
+            echo "JYD_OPENVPN_CONFIG secret is empty or missing" >&2
+            exit 1
+          fi
+
+          ovpn_config="$RUNNER_TEMP/client.ovpn"
+          ovpn_log="$RUNNER_TEMP/openvpn.log"
+          ovpn_pid="$RUNNER_TEMP/openvpn.pid"
+          printf '%s\n' "$JYD_OPENVPN_CONFIG" > "$ovpn_config"
+          chmod 600 "$ovpn_config"
+
+          sudo openvpn \
+            --config "$ovpn_config" \
+            --daemon \
+            --writepid "$ovpn_pid" \
+            --log "$ovpn_log"
+
+          for _ in $(seq 1 60); do
+            if sudo grep -q "Initialization Sequence Completed" "$ovpn_log" 2>/dev/null; then
+              {
+                echo "OPENVPN_LOG=$ovpn_log"
+                echo "OPENVPN_PID_FILE=$ovpn_pid"
+              } >> "$GITHUB_ENV"
+              exit 0
+            fi
+            if [ -s "$ovpn_pid" ]; then
+              pid="$(sudo cat "$ovpn_pid")"
+              if ! sudo kill -0 "$pid" 2>/dev/null; then
+                echo "OpenVPN exited before connecting" >&2
+                sudo tail -n 80 "$ovpn_log" >&2 || true
+                exit 1
+              fi
+            fi
+            sleep 1
+          done
+
+          echo "Timed out waiting for OpenVPN connection" >&2
+          sudo tail -n 120 "$ovpn_log" >&2 || true
+          exit 1
+
+      - name: Install Python dependencies
+        run: |
+          set -euo pipefail
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements.txt
+
+      - name: Run FPGA test
+        id: run_test
+        run: |
+          set +e
+          .venv/bin/python -m jyd_client.cli run "$BITFILE" --skip-login --max-retries 5 \
+            > "$RUNNER_TEMP/jyd_result.json" \
+            2> "$RUNNER_TEMP/jyd_progress.log"
+          status=$?
+          set -e
+          {
+            echo "JYD_EXIT_CODE=$status"
+            echo "JYD_RESULT_JSON=$RUNNER_TEMP/jyd_result.json"
+            echo "JYD_PROGRESS_LOG=$RUNNER_TEMP/jyd_progress.log"
+          } >> "$GITHUB_ENV"
+          exit 0
+
+      - name: Write test summary
+        if: always()
+        env:
+          BITSTREAM_ZIP_URL: ${{ inputs.bitstream_zip_url }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          from pathlib import Path
+
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          result_path = Path(os.environ.get("JYD_RESULT_JSON", ""))
+          progress_path = Path(os.environ.get("JYD_PROGRESS_LOG", ""))
+          exit_code = os.environ.get("JYD_EXIT_CODE", "not run")
+
+          result_text = ""
+          result = None
+          if result_path and result_path.exists():
+              result_text = result_path.read_text(encoding="utf-8", errors="replace").strip()
+              if result_text:
+                  try:
+                      result = json.loads(result_text.splitlines()[-1])
+                  except json.JSONDecodeError:
+                      result = None
+
+          def field(name: str) -> str:
+              if not isinstance(result, dict):
+                  return ""
+              value = result.get(name)
+              if value is None:
+                  return ""
+              if isinstance(value, (dict, list)):
+                  return json.dumps(value, ensure_ascii=False)
+              return str(value)
+
+          progress_tail = ""
+          if progress_path and progress_path.exists():
+              lines = progress_path.read_text(encoding="utf-8", errors="replace").splitlines()
+              progress_tail = "\n".join(lines[-120:])
+
+          lines = [
+              "# FPGA Bitstream Test",
+              "",
+              f"- Zip URL: `{os.environ.get('BITSTREAM_ZIP_URL', '')}`",
+              f"- Bitstream: `{os.environ.get('BITFILE_NAME', 'not extracted')}`",
+              f"- OpenVPN: `{'connected' if os.environ.get('OPENVPN_LOG') else 'not connected'}`",
+              f"- jyd_client exit code: `{exit_code}`",
+          ]
+
+          if isinstance(result, dict):
+              for key in ("success", "task_success", "burned", "fpga_name", "parsed_result", "led", "error"):
+                  value = field(key)
+                  if value != "":
+                      lines.append(f"- {key}: `{value}`")
+
+          lines.extend(["", "## Result JSON", "", "```json", result_text or "(no stdout JSON)", "```"])
+          lines.extend(["", "## Progress Log Tail", "", "```text", progress_tail or "(no stderr log)", "```", ""])
+
+          summary.write_text("\n".join(lines), encoding="utf-8")
+          PY
+
+      - name: Stop OpenVPN
+        if: always()
+        run: |
+          set +e
+          if [ -n "${OPENVPN_PID_FILE:-}" ] && sudo test -s "$OPENVPN_PID_FILE"; then
+            sudo kill "$(sudo cat "$OPENVPN_PID_FILE")"
+          fi
+
+      - name: Fail if FPGA test failed
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ "${JYD_EXIT_CODE:-1}" -ne 0 ]; then
+            exit "${JYD_EXIT_CODE:-1}"
+          fi
