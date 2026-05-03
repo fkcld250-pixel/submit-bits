@@ -157,6 +157,8 @@ jobs:
           import os
           from pathlib import Path
 
+          from jyd_client.led_ascii import format_led_ascii
+
           summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
           result_path = Path(os.environ.get("JYD_RESULT_JSON", ""))
           progress_path = Path(os.environ.get("JYD_PROGRESS_LOG", ""))
@@ -201,6 +203,9 @@ jobs:
                   value = field(key)
                   if value != "":
                       lines.append(f"- {key}: `{value}`")
+              led_board = format_led_ascii(result.get("led"))
+              if led_board:
+                  lines.extend(["", "## LED", "", "```text", led_board, "```"])
 
           lines.extend(["", "## Result JSON", "", "```json", result_text or "(no stdout JSON)", "```"])
           lines.extend(["", "## Progress Log Tail", "", "```text", progress_tail or "(no stderr log)", "```", ""])

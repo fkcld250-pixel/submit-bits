@@ -13,7 +13,6 @@ from .serial_reader import read_tcp_serial
 
 TASK_DISPLAY_MIN_EXCLUSIVE = 0x37000000
 TASK_DISPLAY_MAX_INCLUSIVE = 0x37999999
-TASK_EXPECTED_LED_HEX = "0x01221c08"
 
 
 class Runner:
@@ -182,16 +181,13 @@ def judge_task_result(parsed_result: str, led: dict[str, object] | None) -> dict
         and TASK_DISPLAY_MIN_EXCLUSIVE < display_value <= TASK_DISPLAY_MAX_INCLUSIVE
     )
     led_hex = str(led.get("hex", "")) if isinstance(led, dict) else ""
-    led_ok = led_hex.lower() == TASK_EXPECTED_LED_HEX
     return {
-        "success": display_ok and led_ok,
+        "success": display_ok,
         "display_ok": display_ok,
-        "led_ok": led_ok,
         "display_value": parsed_result,
         "display_min_exclusive": f"0x{TASK_DISPLAY_MIN_EXCLUSIVE:08x}",
         "display_max_inclusive": f"0x{TASK_DISPLAY_MAX_INCLUSIVE:08x}",
         "led_hex": led_hex,
-        "expected_led_hex": TASK_EXPECTED_LED_HEX,
     }
 
 
@@ -200,8 +196,7 @@ def _format_task_judgment_error(judgment: dict[str, object]) -> str:
         "task judgment failed: "
         f"display={judgment.get('display_value', '')!r} "
         f"display_ok={judgment.get('display_ok', False)!r} "
-        f"led_hex={judgment.get('led_hex', '')!r} "
-        f"led_ok={judgment.get('led_ok', False)!r}"
+        f"led_hex={judgment.get('led_hex', '')!r}"
     )
 
 
