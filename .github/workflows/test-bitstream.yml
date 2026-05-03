@@ -134,7 +134,7 @@ jobs:
           set +e
           .venv/bin/python -m jyd_client.cli run "$BITFILE" --skip-login --max-retries 5 \
             > "$RUNNER_TEMP/jyd_result.json" \
-            2> "$RUNNER_TEMP/jyd_progress.log"
+            2> >(tee "$RUNNER_TEMP/jyd_progress.log" >&2)
           status=$?
           set -e
           {
