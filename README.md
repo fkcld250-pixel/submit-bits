@@ -55,6 +55,37 @@ account unless you intend to change that account's counters.
 
 The default configuration targets `192.168.2.200`, MySQL database `port_manager`, and SSH user `remoteuser`.
 
+## GitHub Actions Bitstream Test
+
+The repository includes a manual workflow at
+`.github/workflows/test-bitstream.yml` for testing one submitted bitstream from
+GitHub Actions.
+
+Required repository secrets:
+
+- `JYD_BITSTREAM_ZIP_PASSWORD`: password for the submitted encrypted zip file.
+- `JYD_OPENVPN_CONFIG`: raw text contents of the OpenVPN `.ovpn` profile.
+
+The workflow input is `bitstream_zip_url`, a direct download URL for an
+encrypted `.zip` file. The zip must contain exactly one regular file, and that
+file must use the `.bit` extension. The workflow decrypts the zip with `7z`,
+connects OpenVPN, installs Python dependencies, then runs:
+
+```bash
+python -m jyd_client.cli run "$BITFILE" --skip-login --max-retries 5
+```
+
+Progress logs from `jyd_client` are streamed to the GitHub Actions step log and
+also saved for the job summary. The final result JSON, progress log tail, and
+exit code are written to `GITHUB_STEP_SUMMARY`.
+
+One way to create and upload a test archive is:
+
+```bash
+zip -j -P "$JYD_BITSTREAM_ZIP_PASSWORD" test-bitstream.zip path/to/design.bit
+curl -X POST https://tmpfile.link/api/upload -F "file=@test-bitstream.zip"
+```
+
 ## Configuration
 
 On first run, the client creates `config.toml` next to this README. Edit it if the contest environment changes.
