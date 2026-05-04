@@ -75,9 +75,10 @@ connects OpenVPN, installs Python dependencies, then runs:
 python -m jyd_client.cli run "$BITFILE" --skip-login --max-retries 5
 ```
 
-Progress logs from `jyd_client` are streamed to the GitHub Actions step log and
-also saved for the job summary. The final result JSON, progress log tail, and
-exit code are written to `GITHUB_STEP_SUMMARY`.
+Progress logs from `jyd_client` are streamed to the GitHub Actions step log.
+The workflow uploads a machine-readable `fpga-test-result` artifact containing
+`result.json`. The job summary stays concise and does not render LED ASCII; the
+calling `jyd` workflow owns that presentation.
 
 One way to create and upload a test archive is:
 
@@ -85,6 +86,27 @@ One way to create and upload a test archive is:
 zip -j -P "$JYD_BITSTREAM_ZIP_PASSWORD" test-bitstream.zip path/to/design.bit
 curl -X POST https://tmpfile.link/api/upload -F "file=@test-bitstream.zip"
 ```
+
+## CI Submit Helper
+
+`call_submit.py` is intended to be copied outside this repository and invoked by
+the `jyd` self-hosted runner, for example as `~/jyd/burn.py`.
+
+Required files are resolved relative to the deployed script:
+
+- `secrets/gh_token.txt`: GitHub token with access to trigger and read this repository's Actions runs.
+- `secrets/zip_password.txt`: password used to encrypt the temporary bitstream zip.
+
+Commands:
+
+```bash
+python3 ~/jyd/burn.py update
+python3 ~/jyd/burn.py path/to/top.bit
+```
+
+`update` downloads the latest repository `call_submit.py` and atomically
+replaces the currently executing script path, so the deployed filename does not
+need to be `burn.py`.
 
 ## Configuration
 

@@ -157,11 +157,8 @@ jobs:
           import os
           from pathlib import Path
 
-          from jyd_client.led_ascii import format_led_ascii
-
           summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
           result_path = Path(os.environ.get("JYD_RESULT_JSON", ""))
-          progress_path = Path(os.environ.get("JYD_PROGRESS_LOG", ""))
           exit_code = os.environ.get("JYD_EXIT_CODE", "not run")
 
           result_text = ""
@@ -174,20 +171,18 @@ jobs:
                   except json.JSONDecodeError:
                       result = None
 
-          def field(name: str) -> str:
-              if not isinstance(result, dict):
-                  return ""
-              value = result.get(name)
-              if value is None:
-                  return ""
-              if isinstance(value, (dict, list)):
-                  return json.dumps(value, ensure_ascii=False)
-              return str(value)
-
-          progress_tail = ""
-          if progress_path and progress_path.exists():
-              lines = progress_path.read_text(encoding="utf-8", errors="replace").splitlines()
-              progress_tail = "\n".join(lines[-120:])
+          artifact_dir = Path(os.environ["RUNNER_TEMP"]) / "fpga-test-result"
+          artifact_dir.mkdir(parents=True, exist_ok=True)
+          artifact = {
+              "bitstream_zip_url": os.environ.get("BITSTREAM_ZIP_URL", ""),
+              "bitfile_name": os.environ.get("BITFILE_NAME", "not extracted"),
+              "openvpn_connected": bool(os.environ.get("OPENVPN_LOG")),
+              "jyd_exit_code": exit_code,
+              "result": result if isinstance(result, dict) else None,
+              "raw_stdout": result_text,
+              "error": "" if isinstance(result, dict) else "missing or invalid jyd_client JSON output",
+          }
+          (artifact_dir / "result.json").write_text(json.dumps(artifact, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
           lines = [
               "# FPGA Bitstream Test",
@@ -199,19 +194,22 @@ jobs:
           ]
 
           if isinstance(result, dict):
-              for key in ("success", "task_success", "burned", "fpga_name", "parsed_result", "led", "error"):
-                  value = field(key)
-                  if value != "":
-                      lines.append(f"- {key}: `{value}`")
-              led_board = format_led_ascii(result.get("led"))
-              if led_board:
-                  lines.extend(["", "## LED", "", "```text", led_board, "```"])
+              for key in ("burned", "fpga_name", "parsed_result", "led", "error"):
+                  value = result.get(key)
+                  if value is not None and value != "":
+                      lines.append(f"- {key}: `{json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value}`")
 
-          lines.extend(["", "## Result JSON", "", "```json", result_text or "(no stdout JSON)", "```"])
-          lines.extend(["", "## Progress Log Tail", "", "```text", progress_tail or "(no stderr log)", "```", ""])
+          lines.extend(["", "The machine-readable result is uploaded as the `fpga-test-result` artifact.", ""])
 
           summary.write_text("\n".join(lines), encoding="utf-8")
           PY
+
+      - name: Upload FPGA test result
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fpga-test-result
+          path: ${{ runner.temp }}/fpga-test-result/result.json
 
       - name: Stop OpenVPN
         if: always()
@@ -225,6 +223,10 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          if [ "${JYD_EXIT_CODE:-1}" -ne 0 ]; then
-            exit "${JYD_EXIT_CODE:-1}"
+          code="${JYD_EXIT_CODE:-1}"
+          if ! [[ "$code" =~ ^[0-9]+$ ]]; then
+            exit 1
+          fi
+          if [ "$code" -ne 0 ]; then
+            exit "$code"
           fi
