@@ -92,9 +92,12 @@ curl -X POST https://tmpfile.link/api/upload -F "file=@test-bitstream.zip"
 `call_submit.py` is intended to be copied outside this repository and invoked by
 the `jyd` self-hosted runner, for example as `~/jyd/burn.py`.
 
+The self-hosted machine must have GitHub CLI installed and authenticated with
+`gh auth login`. `call_submit.py` uses `gh api` directly for self-update,
+workflow dispatch, workflow polling, and artifact download.
+
 Required files are resolved relative to the deployed script:
 
-- `secrets/gh_token.txt`: GitHub token with access to trigger and read this repository's Actions runs.
 - `secrets/zip_password.txt`: password used to encrypt the temporary bitstream zip.
 
 Commands:

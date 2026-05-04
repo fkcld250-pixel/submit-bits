@@ -25,7 +25,6 @@ REF = "main"
 WORKFLOW_ID = "test-bitstream.yml"
 REMOTE_SCRIPT_PATH = "call_submit.py"
 TMPFILE_UPLOAD_URL = "https://tmpfile.link/api/upload"
-GITHUB_API = "https://api.github.com"
 RESULT_ARTIFACT_NAME = "fpga-test-result"
 RESULT_JSON_NAME = "result.json"
 POLL_INTERVAL_SECONDS = 10
@@ -51,42 +50,36 @@ def read_secret(script_dir: Path, name: str) -> str:
     return value
 
 
-def github_request(
-    token: str,
-    method: str,
-    url: str,
-    *,
-    payload: dict[str, Any] | None = None,
-    accept: str = "application/vnd.github+json",
-) -> tuple[int, bytes, dict[str, str]]:
-    data = None
-    headers = {
-        "Accept": accept,
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "jyd-call-submit",
-    }
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+def run_gh_api(args: list[str], *, input_data: bytes | None = None) -> bytes:
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            return response.status, response.read(), dict(response.headers)
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise SubmitError(f"GitHub API {method} {url} failed: HTTP {exc.code}: {body}") from exc
-    except urllib.error.URLError as exc:
-        raise SubmitError(f"GitHub API {method} {url} failed: {exc}") from exc
+        completed = subprocess.run(
+            ["gh", "api", *args],
+            input=input_data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    except FileNotFoundError as exc:
+        raise SubmitError("gh command not found; install GitHub CLI and run gh auth login on this machine") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode("utf-8", errors="replace").strip()
+        raise SubmitError(f"gh api failed: {' '.join(args)}\n{stderr}") from exc
+    return completed.stdout
 
 
-def update_self(script_path: Path, token: str) -> None:
-    url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/contents/{REMOTE_SCRIPT_PATH}?ref={urllib.parse.quote(REF)}"
-    status, body, _ = github_request(token, "GET", url)
-    if status != 200:
-        raise SubmitError(f"unexpected GitHub contents status: {status}")
+def gh_api_json(args: list[str], *, input_data: bytes | None = None) -> dict[str, Any]:
+    body = run_gh_api(args, input_data=input_data)
+    if not body:
+        return {}
     data = json.loads(body.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise SubmitError(f"expected JSON object from gh api, got: {type(data).__name__}")
+    return data
+
+
+def update_self(script_path: Path) -> None:
+    endpoint = f"/repos/{OWNER}/{REPO}/contents/{REMOTE_SCRIPT_PATH}?ref={urllib.parse.quote(REF)}"
+    data = gh_api_json([endpoint])
     if data.get("encoding") != "base64" or "content" not in data:
         raise SubmitError("unexpected GitHub contents response for call_submit.py")
 
@@ -160,48 +153,51 @@ def upload_tmpfile(path: Path) -> str:
     return link
 
 
-def dispatch_workflow(token: str, bitstream_zip_url: str) -> int:
-    url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/workflows/{WORKFLOW_ID}/dispatches"
+def dispatch_workflow(bitstream_zip_url: str) -> int:
+    endpoint = f"/repos/{OWNER}/{REPO}/actions/workflows/{WORKFLOW_ID}/dispatches"
     payload = {
         "ref": REF,
         "inputs": {"bitstream_zip_url": bitstream_zip_url},
         "return_run_details": True,
     }
-    status, body, _ = github_request(token, "POST", url, payload=payload)
-    if status == 200 and body:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as f:
+        json.dump(payload, f)
+        payload_path = f.name
+    try:
+        body = run_gh_api(["--method", "POST", endpoint, "--input", payload_path])
+    finally:
+        Path(payload_path).unlink(missing_ok=True)
+
+    if body:
         data = json.loads(body.decode("utf-8"))
-        workflow_run = data.get("workflow_run")
-        if isinstance(workflow_run, dict) and workflow_run.get("id") is not None:
-            return int(workflow_run["id"])
-        if data.get("id") is not None:
-            return int(data["id"])
-        run_url = data.get("url") or data.get("run_url")
-        if isinstance(run_url, str):
-            run_id = int(run_url.rstrip("/").split("/")[-1])
-            return run_id
-    if status != 204:
-        raise SubmitError(f"unexpected workflow dispatch status: {status}")
-    return find_recent_workflow_run(token)
+        if isinstance(data, dict):
+            workflow_run = data.get("workflow_run")
+            if isinstance(workflow_run, dict) and workflow_run.get("id") is not None:
+                return int(workflow_run["id"])
+            if data.get("id") is not None:
+                return int(data["id"])
+            run_url = data.get("url") or data.get("run_url")
+            if isinstance(run_url, str):
+                return int(run_url.rstrip("/").split("/")[-1])
+    return find_recent_workflow_run()
 
 
-def find_recent_workflow_run(token: str) -> int:
+def find_recent_workflow_run() -> int:
     deadline = time.monotonic() + 120
-    url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/workflows/{WORKFLOW_ID}/runs?branch={REF}&event=workflow_dispatch&per_page=10"
+    endpoint = f"/repos/{OWNER}/{REPO}/actions/workflows/{WORKFLOW_ID}/runs?branch={REF}&event=workflow_dispatch&per_page=10"
     while time.monotonic() < deadline:
-        _, body, _ = github_request(token, "GET", url)
-        runs = json.loads(body.decode("utf-8")).get("workflow_runs", [])
+        runs = gh_api_json([endpoint]).get("workflow_runs", [])
         if runs:
             return int(runs[0]["id"])
         time.sleep(5)
     raise SubmitError("could not find the dispatched workflow run")
 
 
-def wait_for_run(token: str, run_id: int) -> dict[str, Any]:
+def wait_for_run(run_id: int) -> dict[str, Any]:
     deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
-    url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runs/{run_id}"
+    endpoint = f"/repos/{OWNER}/{REPO}/actions/runs/{run_id}"
     while time.monotonic() < deadline:
-        _, body, _ = github_request(token, "GET", url)
-        run = json.loads(body.decode("utf-8"))
+        run = gh_api_json([endpoint])
         status = run.get("status")
         conclusion = run.get("conclusion")
         log(f"workflow run {run_id}: status={status} conclusion={conclusion}")
@@ -211,19 +207,18 @@ def wait_for_run(token: str, run_id: int) -> dict[str, Any]:
     raise SubmitError(f"timed out waiting for workflow run {run_id}")
 
 
-def download_result_artifact(token: str, run_id: int, temp_dir: Path) -> dict[str, Any]:
-    url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runs/{run_id}/artifacts?per_page=100"
-    _, body, _ = github_request(token, "GET", url)
-    artifacts = json.loads(body.decode("utf-8")).get("artifacts", [])
+def download_result_artifact(run_id: int, temp_dir: Path) -> dict[str, Any]:
+    endpoint = f"/repos/{OWNER}/{REPO}/actions/runs/{run_id}/artifacts?per_page=100"
+    artifacts = gh_api_json([endpoint]).get("artifacts", [])
     artifact = next((item for item in artifacts if item.get("name") == RESULT_ARTIFACT_NAME), None)
     if artifact is None:
         names = ", ".join(str(item.get("name")) for item in artifacts)
         raise SubmitError(f"result artifact {RESULT_ARTIFACT_NAME!r} not found; artifacts: {names}")
 
-    archive_url = artifact.get("archive_download_url")
-    if not isinstance(archive_url, str):
-        raise SubmitError("result artifact did not include archive_download_url")
-    _, archive_bytes, _ = github_request(token, "GET", archive_url, accept="application/vnd.github+json")
+    artifact_id = artifact.get("id")
+    if artifact_id is None:
+        raise SubmitError("result artifact did not include id")
+    archive_bytes = run_gh_api([f"/repos/{OWNER}/{REPO}/actions/artifacts/{artifact_id}/zip"])
     artifact_zip = temp_dir / "result-artifact.zip"
     artifact_zip.write_bytes(archive_bytes)
 
@@ -266,7 +261,6 @@ def print_public_result(run: dict[str, Any], result: dict[str, Any]) -> None:
 
 
 def submit_bitfile(script_dir: Path, bitfile: Path) -> int:
-    token = read_secret(script_dir, "gh_token.txt")
     password = read_secret(script_dir, "zip_password.txt")
 
     with tempfile.TemporaryDirectory(prefix="jyd-call-submit-") as temp:
@@ -275,10 +269,10 @@ def submit_bitfile(script_dir: Path, bitfile: Path) -> int:
         log(f"created encrypted zip: {zip_path}")
         download_url = upload_tmpfile(zip_path)
         log(f"uploaded encrypted zip: {download_url}")
-        run_id = dispatch_workflow(token, download_url)
+        run_id = dispatch_workflow(download_url)
         log(f"dispatched workflow run: https://github.com/{OWNER}/{REPO}/actions/runs/{run_id}")
-        run = wait_for_run(token, run_id)
-        result = download_result_artifact(token, run_id, temp_dir)
+        run = wait_for_run(run_id)
+        result = download_result_artifact(run_id, temp_dir)
         print_public_result(run, result)
         return 0 if run.get("conclusion") == "success" else 1
 
@@ -293,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.arg == "update":
-            update_self(script_path, read_secret(script_dir, "gh_token.txt"))
+            update_self(script_path)
             return 0
         if not args.arg:
             parser.error("bitfile is required unless using the update subcommand")
