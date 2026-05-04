@@ -111,6 +111,12 @@ python3 ~/jyd/burn.py path/to/top.bit
 replaces the currently executing script path, so the deployed filename does not
 need to be `burn.py`.
 
+The bitstream submit command writes progress logs to stderr with `HH:MM:SS`
+timestamps and keeps stdout as a single machine-readable JSON object. Remote
+GitHub run IDs, GitHub URLs, upload URLs, and detailed error text are not
+printed. The public JSON fields are `workflow_conclusion`, `burned`, `seg`,
+`led`, and `has_error`.
+
 ## Configuration
 
 On first run, the client creates `config.toml` next to this README. Edit it if the contest environment changes.

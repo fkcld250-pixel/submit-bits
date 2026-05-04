@@ -5,3 +5,4 @@ AGENTS.md
 results.jsonl
 
 */__pycache__/*
+__pycache__/

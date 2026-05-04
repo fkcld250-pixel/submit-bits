@@ -36,7 +36,8 @@ class SubmitError(RuntimeError):
 
 
 def log(message: str) -> None:
-    print(message, file=sys.stderr, flush=True)
+    timestamp = time.strftime("%H:%M:%S")
+    print(f"[{timestamp}] {message}", file=sys.stderr, flush=True)
 
 
 def read_secret(script_dir: Path, name: str) -> str:
@@ -88,7 +89,7 @@ def update_self(script_path: Path) -> None:
     tmp_path.write_bytes(content)
     tmp_path.chmod(script_path.stat().st_mode)
     os.replace(tmp_path, script_path)
-    log(f"updated {script_path} from {OWNER}/{REPO}@{REF}:{REMOTE_SCRIPT_PATH}")
+    log("script updated")
 
 
 def run_command(args: list[str]) -> None:
@@ -200,11 +201,11 @@ def wait_for_run(run_id: int) -> dict[str, Any]:
         run = gh_api_json([endpoint])
         status = run.get("status")
         conclusion = run.get("conclusion")
-        log(f"workflow run {run_id}: status={status} conclusion={conclusion}")
+        log(f"workflow : status={status} conclusion={conclusion}")
         if status == "completed":
             return run
         time.sleep(POLL_INTERVAL_SECONDS)
-    raise SubmitError(f"timed out waiting for workflow run {run_id}")
+    raise SubmitError("timed out waiting for workflow run")
 
 
 def download_result_artifact(run_id: int, temp_dir: Path) -> dict[str, Any]:
@@ -248,14 +249,24 @@ def print_public_result(run: dict[str, Any], result: dict[str, Any]) -> None:
     raw = result.get("result")
     if not isinstance(raw, dict):
         raw = {}
+    error_text = raw.get("error") or result.get("error") or ""
     output = {
-        "workflow_run_id": run.get("id"),
-        "workflow_url": run.get("html_url"),
         "workflow_conclusion": run.get("conclusion"),
         "burned": raw.get("burned"),
         "seg": raw.get("parsed_result", ""),
         "led": normalize_led_hex(raw.get("led")),
-        "error": raw.get("error") or result.get("error") or "",
+        "has_error": bool(error_text),
+    }
+    print(json.dumps(output, ensure_ascii=False), flush=True)
+
+
+def print_error_result() -> None:
+    output = {
+        "workflow_conclusion": None,
+        "burned": False,
+        "seg": "",
+        "led": "",
+        "has_error": True,
     }
     print(json.dumps(output, ensure_ascii=False), flush=True)
 
@@ -266,11 +277,11 @@ def submit_bitfile(script_dir: Path, bitfile: Path) -> int:
     with tempfile.TemporaryDirectory(prefix="jyd-call-submit-") as temp:
         temp_dir = Path(temp)
         zip_path = create_encrypted_zip(bitfile, password, temp_dir)
-        log(f"created encrypted zip: {zip_path}")
+        log("encrypted zip created")
         download_url = upload_tmpfile(zip_path)
-        log(f"uploaded encrypted zip: {download_url}")
+        log("encrypted zip uploaded")
         run_id = dispatch_workflow(download_url)
-        log(f"dispatched workflow run: https://github.com/{OWNER}/{REPO}/actions/runs/{run_id}")
+        log("workflow run dispatched")
         run = wait_for_run(run_id)
         result = download_result_artifact(run_id, temp_dir)
         print_public_result(run, result)
@@ -293,8 +304,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("bitfile is required unless using the update subcommand")
         return submit_bitfile(script_dir, Path(args.arg).expanduser().resolve())
     except SubmitError as exc:
-        print(json.dumps({"burned": False, "seg": "", "led": "", "error": str(exc)}, ensure_ascii=False))
-        print(f"error: {exc}", file=sys.stderr)
+        print_error_result()
+        log("error occurred")
         return 1
 
 
