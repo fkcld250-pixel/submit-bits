@@ -174,7 +174,6 @@ jobs:
           artifact_dir = Path(os.environ["RUNNER_TEMP"]) / "fpga-test-result"
           artifact_dir.mkdir(parents=True, exist_ok=True)
           artifact = {
-              "bitstream_zip_url": os.environ.get("BITSTREAM_ZIP_URL", ""),
               "bitfile_name": os.environ.get("BITFILE_NAME", "not extracted"),
               "openvpn_connected": bool(os.environ.get("OPENVPN_LOG")),
               "jyd_exit_code": exit_code,
@@ -187,7 +186,6 @@ jobs:
           lines = [
               "# FPGA Bitstream Test",
               "",
-              f"- Zip URL: `{os.environ.get('BITSTREAM_ZIP_URL', '')}`",
               f"- Bitstream: `{os.environ.get('BITFILE_NAME', 'not extracted')}`",
               f"- OpenVPN: `{'connected' if os.environ.get('OPENVPN_LOG') else 'not connected'}`",
               f"- jyd_client exit code: `{exit_code}`",
