@@ -54,6 +54,8 @@ Do not run `set-user-usage` or real `run`/`batch` tests against a production
 account unless you intend to change that account's counters.
 
 The default configuration targets `192.168.2.200`, MySQL database `port_manager`, and SSH user `remoteuser`.
+The current official Windows package uses `mhw168` for both the MySQL root
+password and the remote Windows SSH password.
 
 ## GitHub Actions Bitstream Test
 
@@ -123,11 +125,16 @@ On first run, the client creates `config.toml` next to this README. Edit it if t
 
 Important defaults:
 
-- MySQL: `192.168.2.200:3306`, user `root`, password `jyd123`, database `port_manager`
-- SSH: user `remoteuser`, password `jyd123`, port `22`
+- MySQL: `192.168.2.200:3306`, user `root`, password `mhw168`, database `port_manager`
+- SSH: user `remoteuser`, password `mhw168`, port `22`
 - Remote Vivado path: `D:/vivado/Vivado/2023.2/bin/vivado.bat`
 - Remote temp directory: `C:/Temp`
-- Serial read: polls with byte `0x80` every `0.701s` at `9600` baud, then waits until the parsed display and LED state have stayed unchanged for `10s`. Override per run with `--stable-seconds`.
+- Serial read: polls with byte `0x80` every `0.701s` at `9600` baud, then waits until the parsed display and LED state have stayed unchanged for `15s`. Override per run with `--stable-seconds`.
+- Board allocation follows the new official heartbeat flow: normal runs may
+  reclaim `in_use` boards whose `last_heartbeat` is older than 3 minutes, and
+  the Linux client refreshes `last_heartbeat` every 45 seconds while a board is
+  allocated. Older databases without `last_heartbeat` fall back to the previous
+  `status = 'available'` selection.
 
 ## Output
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 import time
 
 from .db import Database
@@ -18,7 +19,9 @@ TASK_DISPLAY_MAX_INCLUSIVE = 0x37999999
 class Runner:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.db = Database(cfg.mysql)
+        mysql_cfg = dict(cfg.mysql)
+        mysql_cfg["stale_board_minutes"] = cfg.remote.get("stale_board_minutes", 3)
+        self.db = Database(mysql_cfg)
 
     def run_bitfile(
         self,
@@ -32,6 +35,7 @@ class Runner:
         bit_path = Path(bitfile).expanduser().resolve()
         result = RunResult.start(str(bit_path))
         board = None
+        heartbeat = None
         if not bit_path.exists():
             result.error = f"bitfile not found: {bit_path}"
             result.finish()
@@ -39,6 +43,13 @@ class Runner:
 
         try:
             board = self.db.allocate_board(force=force_use, fpga_name=fpga_name)
+            heartbeat = _BoardHeartbeat(
+                self.db,
+                board.fpga_name,
+                enabled=bool(self.cfg.remote.get("heartbeat_enabled", True)),
+                interval_seconds=float(self.cfg.remote.get("heartbeat_interval_seconds", 45)),
+            )
+            heartbeat.start()
             result.fpga_name = board.fpga_name
             result.board_ip = board.ip
             result.expected_result = board.expected_result
@@ -154,6 +165,8 @@ class Runner:
                         log(release_error)
                 else:
                     log(f"skipping board release for {board.fpga_name}; status remains in_use")
+            if heartbeat is not None:
+                heartbeat.stop()
             result.task_judgment = judge_task_result(result.parsed_result, result.led)
             result.task_success = bool(result.task_judgment["success"])
             result.finish()
@@ -258,6 +271,44 @@ def _is_legal_display(display: str, min_value: int) -> bool:
         return int(display, 16) >= min_value
     except ValueError:
         return False
+
+
+class _BoardHeartbeat:
+    def __init__(self, db: Database, fpga_name: str, *, enabled: bool, interval_seconds: float) -> None:
+        self.db = db
+        self.fpga_name = fpga_name
+        self.enabled = enabled
+        self.interval_seconds = max(1.0, interval_seconds)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        if not self.db.update_board_heartbeat(self.fpga_name):
+            log("board heartbeat disabled: fpga_boards.last_heartbeat column is unavailable")
+            self.enabled = False
+            return
+        self._thread = threading.Thread(target=self._run, name=f"jyd-heartbeat-{self.fpga_name}", daemon=True)
+        self._thread.start()
+        log(f"started board heartbeat for {self.fpga_name} every {self.interval_seconds:g}s")
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=min(5.0, self.interval_seconds))
+        log(f"stopped board heartbeat for {self.fpga_name}")
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                if not self.db.update_board_heartbeat(self.fpga_name):
+                    log("board heartbeat stopped: fpga_boards.last_heartbeat column is unavailable")
+                    return
+            except Exception as exc:
+                log(f"board heartbeat update failed for {self.fpga_name}: {exc}")
+                return
 
 
 def _log_stable_signal_sample(snapshot: object, stable_elapsed: float) -> None:

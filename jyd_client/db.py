@@ -180,21 +180,48 @@ class Database:
             where_sql = "WHERE fpga_name = %s"
             params = (fpga_name,)
         elif not force:
-            where_sql = "WHERE status = 'available'"
+            stale_minutes = int(self.cfg.get("stale_board_minutes", 3))
+            where_sql = (
+                "WHERE status = 'available' "
+                "OR (status = 'in_use' AND last_heartbeat < "
+                f"DATE_SUB(NOW(), INTERVAL {stale_minutes} MINUTE))"
+            )
         select_sql = f"""
             SELECT fpga_name, total_port, twin_port, jtag_filter, vcom_name, com_name, IP, result
             FROM fpga_boards
             {where_sql}
+            ORDER BY status DESC, last_heartbeat ASC, RAND()
+            LIMIT 1
+        """
+        fallback_select_sql = f"""
+            SELECT fpga_name, total_port, twin_port, jtag_filter, vcom_name, com_name, IP, result
+            FROM fpga_boards
+            {"WHERE fpga_name = %s" if fpga_name else "" if force else "WHERE status = 'available'"}
             ORDER BY RAND()
             LIMIT 1
         """
-        update_sql = "UPDATE fpga_boards SET status = 'in_use' WHERE fpga_name = %s AND status = 'available'"
-        force_update_sql = "UPDATE fpga_boards SET status = 'in_use' WHERE fpga_name = %s"
+        update_sql = (
+            "UPDATE fpga_boards SET status = 'in_use', last_heartbeat = NOW() "
+            "WHERE fpga_name = %s AND (status = 'available' OR last_heartbeat < "
+            f"DATE_SUB(NOW(), INTERVAL {int(self.cfg.get('stale_board_minutes', 3))} MINUTE))"
+        )
+        fallback_update_sql = (
+            "UPDATE fpga_boards SET status = 'in_use' WHERE fpga_name = %s AND status = 'available'"
+        )
+        force_update_sql = "UPDATE fpga_boards SET status = 'in_use', last_heartbeat = NOW() WHERE fpga_name = %s"
+        fallback_force_update_sql = "UPDATE fpga_boards SET status = 'in_use' WHERE fpga_name = %s"
         for _ in range(5):
             with self.connect() as conn:
                 try:
                     with conn.cursor() as cur:
-                        cur.execute(select_sql, params)
+                        using_heartbeat = True
+                        try:
+                            cur.execute(select_sql, params)
+                        except Exception as exc:
+                            if not _is_unknown_column_error(exc, "last_heartbeat"):
+                                raise
+                            using_heartbeat = False
+                            cur.execute(fallback_select_sql, params)
                         row = cur.fetchone()
                         if not row:
                             if fpga_name:
@@ -204,10 +231,13 @@ class Database:
                             raise BoardUnavailableError("no available FPGA board")
                         board = Board.from_row(row)
                         if force or fpga_name:
-                            cur.execute(force_update_sql, (board.fpga_name,))
+                            cur.execute(
+                                force_update_sql if using_heartbeat else fallback_force_update_sql,
+                                (board.fpga_name,),
+                            )
                             conn.commit()
                             return board
-                        cur.execute(update_sql, (board.fpga_name,))
+                        cur.execute(update_sql if using_heartbeat else fallback_update_sql, (board.fpga_name,))
                         if cur.rowcount != 1:
                             conn.rollback()
                             continue
@@ -221,14 +251,43 @@ class Database:
     def release_board(self, fpga_name: str) -> None:
         with self.connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE fpga_boards SET status = 'available' WHERE fpga_name = %s", (fpga_name,))
+                try:
+                    cur.execute(
+                        "UPDATE fpga_boards SET status = 'available', last_heartbeat = NULL WHERE fpga_name = %s",
+                        (fpga_name,),
+                    )
+                except Exception as exc:
+                    if not _is_unknown_column_error(exc, "last_heartbeat"):
+                        raise
+                    cur.execute("UPDATE fpga_boards SET status = 'available' WHERE fpga_name = %s", (fpga_name,))
             conn.commit()
 
     def mark_board_in_use(self, fpga_name: str) -> None:
         with self.connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE fpga_boards SET status = 'in_use' WHERE fpga_name = %s", (fpga_name,))
+                try:
+                    cur.execute(
+                        "UPDATE fpga_boards SET status = 'in_use', last_heartbeat = NOW() WHERE fpga_name = %s",
+                        (fpga_name,),
+                    )
+                except Exception as exc:
+                    if not _is_unknown_column_error(exc, "last_heartbeat"):
+                        raise
+                    cur.execute("UPDATE fpga_boards SET status = 'in_use' WHERE fpga_name = %s", (fpga_name,))
             conn.commit()
+
+    def update_board_heartbeat(self, fpga_name: str) -> bool:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute("UPDATE fpga_boards SET last_heartbeat = NOW() WHERE fpga_name = %s", (fpga_name,))
+                except Exception as exc:
+                    if _is_unknown_column_error(exc, "last_heartbeat"):
+                        conn.rollback()
+                        return False
+                    raise
+            conn.commit()
+        return True
 
     def reset_all_boards_available(self) -> int:
         with self.connect() as conn:
@@ -284,3 +343,8 @@ def _quota_exhausted(used_times: int | None, limit_times: int | None) -> bool:
 
 def _format_quota_error(used_times: int | None, limit_times: int | None) -> str:
     return f"usage quota exhausted: used_times={used_times or 0} limit_times={limit_times}"
+
+
+def _is_unknown_column_error(exc: Exception, column: str) -> bool:
+    text = str(exc).lower()
+    return "unknown column" in text and column.lower() in text

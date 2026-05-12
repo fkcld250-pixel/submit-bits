@@ -2,13 +2,13 @@
 host = "192.168.2.200"
 port = 3306
 user = "root"
-password = "jyd123"
+password = "mhw168"
 database = "port_manager"
 charset = "utf8mb4"
 
 [ssh]
 user = "remoteuser"
-password = "jyd123"
+password = "mhw168"
 port = 22
 timeout = 20
 
@@ -25,6 +25,9 @@ serial_poll_interval_seconds = 0.701
 serial_max_payload_bytes = 0
 hw_server_script_path = "C:/Temp/start_hw_server.ps1"
 use_generated_hw_server_script = false
+heartbeat_enabled = true
+heartbeat_interval_seconds = 45
+stale_board_minutes = 3
 
 [local]
 results_jsonl = "results.jsonl"
