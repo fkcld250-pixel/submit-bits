@@ -154,12 +154,24 @@ def upload_tmpfile(path: Path) -> str:
     return link
 
 
+def list_recent_workflow_runs() -> list[dict[str, Any]]:
+    endpoint = f"/repos/{OWNER}/{REPO}/actions/workflows/{WORKFLOW_ID}/runs?branch={REF}&event=workflow_dispatch&per_page=20"
+    runs = gh_api_json([endpoint]).get("workflow_runs", [])
+    if not isinstance(runs, list):
+        raise SubmitError("unexpected GitHub workflow runs response")
+    return [run for run in runs if isinstance(run, dict)]
+
+
 def dispatch_workflow(bitstream_zip_url: str) -> int:
+    known_run_ids = {
+        int(run["id"])
+        for run in list_recent_workflow_runs()
+        if run.get("id") is not None
+    }
     endpoint = f"/repos/{OWNER}/{REPO}/actions/workflows/{WORKFLOW_ID}/dispatches"
     payload = {
         "ref": REF,
         "inputs": {"bitstream_zip_url": bitstream_zip_url},
-        "return_run_details": True,
     }
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as f:
         json.dump(payload, f)
@@ -180,16 +192,19 @@ def dispatch_workflow(bitstream_zip_url: str) -> int:
             run_url = data.get("url") or data.get("run_url")
             if isinstance(run_url, str):
                 return int(run_url.rstrip("/").split("/")[-1])
-    return find_recent_workflow_run()
+    return find_recent_workflow_run(known_run_ids)
 
 
-def find_recent_workflow_run() -> int:
+def find_recent_workflow_run(known_run_ids: set[int]) -> int:
     deadline = time.monotonic() + 120
-    endpoint = f"/repos/{OWNER}/{REPO}/actions/workflows/{WORKFLOW_ID}/runs?branch={REF}&event=workflow_dispatch&per_page=10"
     while time.monotonic() < deadline:
-        runs = gh_api_json([endpoint]).get("workflow_runs", [])
-        if runs:
-            return int(runs[0]["id"])
+        for run in list_recent_workflow_runs():
+            run_id = run.get("id")
+            if run_id is None:
+                continue
+            run_id = int(run_id)
+            if run_id not in known_run_ids:
+                return run_id
         time.sleep(5)
     raise SubmitError("could not find the dispatched workflow run")
 
@@ -260,7 +275,7 @@ def print_public_result(run: dict[str, Any], result: dict[str, Any]) -> None:
     print(json.dumps(output, ensure_ascii=False), flush=True)
 
 
-def print_error_result() -> None:
+def print_error_result(error_text: str = "", *, debug: bool = False) -> None:
     output = {
         "workflow_conclusion": None,
         "burned": False,
@@ -268,6 +283,8 @@ def print_error_result() -> None:
         "led": "",
         "has_error": True,
     }
+    if debug and error_text:
+        output["error"] = error_text
     print(json.dumps(output, ensure_ascii=False), flush=True)
 
 
@@ -291,6 +308,7 @@ def submit_bitfile(script_dir: Path, bitfile: Path) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Submit one JYD bitstream to the remote FPGA test workflow.")
     parser.add_argument("arg", nargs="?", help="'update' or the path to the top.bit file to submit.")
+    parser.add_argument("--debug", action="store_true", help="show detailed submit errors on failure")
     args = parser.parse_args(argv)
 
     script_path = Path(__file__).resolve()
@@ -304,8 +322,12 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("bitfile is required unless using the update subcommand")
         return submit_bitfile(script_dir, Path(args.arg).expanduser().resolve())
     except SubmitError as exc:
-        print_error_result()
-        log("error occurred")
+        error_text = str(exc)
+        print_error_result(error_text, debug=args.debug)
+        if args.debug:
+            log(f"error occurred: {error_text}")
+        else:
+            log("error occurred")
         return 1
 
 
