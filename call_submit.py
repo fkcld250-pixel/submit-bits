@@ -10,10 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
-import uuid
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -121,34 +118,40 @@ def create_encrypted_zip(bitfile: Path, password: str, temp_dir: Path) -> Path:
 
 
 def upload_tmpfile(path: Path) -> str:
-    boundary = f"----jyd-{uuid.uuid4().hex}"
-    file_bytes = path.read_bytes()
-    filename = path.name
-    body = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
-        "Content-Type: application/zip\r\n\r\n"
-    ).encode("utf-8") + file_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
-
-    request = urllib.request.Request(
-        TMPFILE_UPLOAD_URL,
-        data=body,
-        headers={
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "jyd-call-submit",
-        },
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(request, timeout=300) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", errors="replace")
-        raise SubmitError(f"tmpfile upload failed: HTTP {exc.code}: {body_text}") from exc
-    except urllib.error.URLError as exc:
-        raise SubmitError(f"tmpfile upload failed: {exc}") from exc
+        completed = subprocess.run(
+            [
+                "curl",
+                "--silent",
+                "--show-error",
+                "--fail-with-body",
+                "--max-time",
+                "300",
+                "--form",
+                f"file=@{path}",
+                TMPFILE_UPLOAD_URL,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    except FileNotFoundError as exc:
+        raise SubmitError("curl command not found; curl is required to upload the bitstream") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode("utf-8", errors="replace").strip()
+        body = exc.stdout.decode("utf-8", errors="replace").strip()
+        detail = stderr or body or f"curl exit code {exc.returncode}"
+        raise SubmitError(f"tmpfile upload failed: {detail}") from exc
 
-    link = data.get("downloadLinkEncoded") or data.get("downloadLink")
+    try:
+        data = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        response = completed.stdout.decode("utf-8", errors="replace")
+        raise SubmitError(f"tmpfile upload returned invalid JSON: {response}") from exc
+    if not isinstance(data, dict):
+        raise SubmitError(f"tmpfile upload returned unexpected JSON: {data}")
+
+    link = data.get("downloadLink")
     if not isinstance(link, str) or not link:
         raise SubmitError(f"tmpfile response did not contain a download link: {data}")
     return link
