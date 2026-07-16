@@ -28,6 +28,8 @@ RESULT_ARTIFACT_NAME = "fpga-test-result"
 RESULT_JSON_NAME = "result.json"
 POLL_INTERVAL_SECONDS = 10
 POLL_TIMEOUT_SECONDS = 60 * 60
+GH_API_MAX_RETRIES = 5
+GH_API_RETRY_BASE_SECONDS = 2
 
 
 class SubmitError(RuntimeError):
@@ -50,21 +52,53 @@ def read_secret(script_dir: Path, name: str) -> str:
     return value
 
 
+def is_retryable_gh_error(stderr: str) -> bool:
+    detail = stderr.lower()
+    retryable_markers = (
+        "eof",
+        "connection reset",
+        "connection refused",
+        "error connecting",
+        "could not resolve host",
+        "context deadline exceeded",
+        "i/o timeout",
+        "tls handshake timeout",
+        "temporary failure",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+    )
+    return any(marker in detail for marker in retryable_markers)
+
+
 def run_gh_api(args: list[str], *, input_data: bytes | None = None) -> bytes:
-    try:
-        completed = subprocess.run(
-            ["gh", "api", *args],
-            input=input_data,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-        )
-    except FileNotFoundError as exc:
-        raise SubmitError("gh command not found; install GitHub CLI and run gh auth login on this machine") from exc
-    except subprocess.CalledProcessError as exc:
-        stderr = exc.stderr.decode("utf-8", errors="replace").strip()
-        raise SubmitError(f"gh api failed: {' '.join(args)}\n{stderr}") from exc
-    return completed.stdout
+    for retry_count in range(GH_API_MAX_RETRIES + 1):
+        try:
+            completed = subprocess.run(
+                ["gh", "api", *args],
+                input=input_data,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            return completed.stdout
+        except FileNotFoundError as exc:
+            raise SubmitError("gh command not found; install GitHub CLI and run gh auth login on this machine") from exc
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode("utf-8", errors="replace").strip()
+            if retry_count >= GH_API_MAX_RETRIES or not is_retryable_gh_error(stderr):
+                raise SubmitError(f"gh api failed: {' '.join(args)}\n{stderr}") from exc
+
+            delay = GH_API_RETRY_BASE_SECONDS * (2**retry_count)
+            log(
+                f"gh api temporarily failed; retry {retry_count + 1}/{GH_API_MAX_RETRIES} "
+                f"in {delay}s: {stderr}"
+            )
+            time.sleep(delay)
+
+    raise AssertionError("unreachable")
 
 
 def gh_api_json(args: list[str], *, input_data: bytes | None = None) -> dict[str, Any]:
