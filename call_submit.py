@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,8 @@ REPO = "submit-bits"
 REF = "main"
 WORKFLOW_ID = "test-bitstream.yml"
 REMOTE_SCRIPT_PATH = "call_submit.py"
-TMPFILE_UPLOAD_URL = "https://tmpfile.link/api/upload"
+TEMPFILE_UPLOAD_URL = "https://tempfile.org/api/upload/local"
+FILEBIN_BASE_URL = "https://filebin.net"
 RESULT_ARTIFACT_NAME = "fpga-test-result"
 RESULT_JSON_NAME = "result.json"
 POLL_INTERVAL_SECONDS = 10
@@ -117,7 +119,7 @@ def create_encrypted_zip(bitfile: Path, password: str, temp_dir: Path) -> Path:
     return zip_path
 
 
-def upload_tmpfile(path: Path) -> str:
+def run_upload_curl(args: list[str], service: str) -> bytes:
     try:
         completed = subprocess.run(
             [
@@ -127,9 +129,7 @@ def upload_tmpfile(path: Path) -> str:
                 "--fail-with-body",
                 "--max-time",
                 "300",
-                "--form",
-                f"file=@{path}",
-                TMPFILE_UPLOAD_URL,
+                *args,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -141,20 +141,75 @@ def upload_tmpfile(path: Path) -> str:
         stderr = exc.stderr.decode("utf-8", errors="replace").strip()
         body = exc.stdout.decode("utf-8", errors="replace").strip()
         detail = stderr or body or f"curl exit code {exc.returncode}"
-        raise SubmitError(f"tmpfile upload failed: {detail}") from exc
+        raise SubmitError(f"{service} upload failed: {detail}") from exc
+    return completed.stdout
+
+
+def parse_upload_json(body: bytes, service: str) -> dict[str, Any]:
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        response = body.decode("utf-8", errors="replace")
+        raise SubmitError(f"{service} returned invalid JSON: {response}") from exc
+    if not isinstance(data, dict):
+        raise SubmitError(f"{service} returned unexpected JSON: {data}")
+    return data
+
+
+def upload_tempfile_org(path: Path) -> str:
+    body = run_upload_curl(
+        [
+            "--form",
+            f"files=@{path}",
+            "--form",
+            "expiryHours=24",
+            TEMPFILE_UPLOAD_URL,
+        ],
+        "TempFile.org",
+    )
+    data = parse_upload_json(body, "TempFile.org")
+    files = data.get("files")
+    item = files[0] if isinstance(files, list) and files and isinstance(files[0], dict) else {}
+    file_id = item.get("id")
+    if data.get("success") is not True or not isinstance(file_id, str) or not file_id:
+        raise SubmitError(f"TempFile.org response did not contain a file id: {data}")
+    return f"https://tempfile.org/{urllib.parse.quote(file_id, safe='')}/download"
+
+
+def upload_filebin(path: Path) -> str:
+    bin_id = f"jyd-{uuid.uuid4().hex}"
+    filename = urllib.parse.quote(path.name, safe="")
+    download_url = f"{FILEBIN_BASE_URL}/{bin_id}/{filename}"
+    body = run_upload_curl(
+        [
+            "--data-binary",
+            f"@{path}",
+            "--header",
+            "Content-Type: application/octet-stream",
+            download_url,
+        ],
+        "Filebin",
+    )
+    data = parse_upload_json(body, "Filebin")
+    file_data = data.get("file")
+    if not isinstance(file_data, dict) or file_data.get("filename") != path.name:
+        raise SubmitError(f"Filebin response did not confirm the uploaded file: {data}")
+    return download_url
+
+
+def upload_tmpfile(path: Path) -> str:
+    try:
+        return upload_tempfile_org(path)
+    except SubmitError as primary_error:
+        primary_detail = str(primary_error)
+        log(f"TempFile.org unavailable, trying Filebin: {primary_error}")
 
     try:
-        data = json.loads(completed.stdout.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        response = completed.stdout.decode("utf-8", errors="replace")
-        raise SubmitError(f"tmpfile upload returned invalid JSON: {response}") from exc
-    if not isinstance(data, dict):
-        raise SubmitError(f"tmpfile upload returned unexpected JSON: {data}")
-
-    link = data.get("downloadLink")
-    if not isinstance(link, str) or not link:
-        raise SubmitError(f"tmpfile response did not contain a download link: {data}")
-    return link
+        return upload_filebin(path)
+    except SubmitError as fallback_error:
+        raise SubmitError(
+            f"all temporary upload services failed; primary: {primary_detail}; fallback: {fallback_error}"
+        ) from fallback_error
 
 
 def list_recent_workflow_runs() -> list[dict[str, Any]]:
